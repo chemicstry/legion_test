@@ -1,10 +1,22 @@
-use legion::*;
-use legion::query::{Query, View, EntityFilter, DefaultFilter};
-use legion::world::{SubWorld, Permissions, ArchetypeAccess, WorldId, ComponentAccess};
-use legion::storage::ComponentTypeId;
-use legion::systems::{CommandBuffer, ResourceTypeId, Runnable, SystemId, Resource, ResourceSet, QuerySet};
-use std::{any::TypeId, borrow::Cow, collections::HashMap, marker::PhantomData};
 use bit_set::BitSet;
+use legion::query::{
+    ComponentFilter, DefaultFilter, EntityFilter, EntityFilterTuple, Passthrough, Query, View,
+};
+use legion::storage::ComponentTypeId;
+use legion::systems::{
+    CommandBuffer, QuerySet, Resource, ResourceSet, ResourceTypeId, Runnable, SystemId,
+};
+use legion::world::{ArchetypeAccess, ComponentAccess, Permissions, SubWorld, WorldId};
+use legion::*;
+use std::{borrow::Cow, collections::HashMap, marker::PhantomData};
+
+struct TestResourceA {
+    a: i32,
+}
+
+struct TestResourceB {
+    b: i32,
+}
 
 // a component is any type that is 'static, sized, send and sync
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -36,8 +48,7 @@ pub trait QueryData {
     fn permissions() -> Permissions<ComponentTypeId>;
 }
 
-impl QueryData for ()
-{
+impl QueryData for () {
     fn permissions() -> Permissions<ComponentTypeId> {
         return Permissions::default();
     }
@@ -57,16 +68,15 @@ pub trait ResourceData {
     fn permissions() -> Permissions<ResourceTypeId>;
 }
 
-impl ResourceData for ()
-{
+impl ResourceData for () {
     fn permissions() -> Permissions<ResourceTypeId> {
         return Permissions::default();
     }
 }
 
-impl<T> ResourceData for Read::<T>
+impl<T> ResourceData for Read<T>
 where
-    T: Resource
+    T: Resource,
 {
     fn permissions() -> Permissions<ResourceTypeId> {
         let mut permissions = Permissions::default();
@@ -75,9 +85,9 @@ where
     }
 }
 
-impl<T> ResourceData for Write::<T>
+impl<T> ResourceData for Write<T>
 where
-    T: Resource
+    T: Resource,
 {
     fn permissions() -> Permissions<ResourceTypeId> {
         let mut permissions = Permissions::default();
@@ -90,7 +100,13 @@ pub trait System {
     type ResourceData: ResourceData + ResourceSet<'static>;
     type QueryData: QueryData;
 
-    fn run(&mut self, resources: &mut <Self::ResourceData as ResourceSet<'static>>::Result, queries: &mut Self::QueryData, command_buffer: &mut CommandBuffer, world: &mut SubWorld);
+    fn run(
+        &mut self,
+        resources: &mut <Self::ResourceData as ResourceSet<'static>>::Result,
+        queries: &mut Self::QueryData,
+        command_buffer: &mut CommandBuffer,
+        world: &mut SubWorld,
+    );
 }
 
 pub struct SystemWrapper<'a, R, Q> {
@@ -103,7 +119,7 @@ pub struct SystemWrapper<'a, R, Q> {
     // We pre-allocate a command buffer for ourself. Writes are self-draining so we never have to rellocate.
     command_buffer: HashMap<WorldId, CommandBuffer>,
 
-    system: &'a mut (System<ResourceData = R, QueryData = Q> + Send + Sync),
+    system: &'a mut (dyn System<ResourceData = R, QueryData = Q> + Send + Sync),
 }
 
 #[derive(Debug, Clone)]
@@ -141,7 +157,9 @@ where
         }
     }
 
-    fn accesses_archetypes(&self) -> &ArchetypeAccess { &self.archetypes }
+    fn accesses_archetypes(&self) -> &ArchetypeAccess {
+        &self.archetypes
+    }
 
     fn command_buffer_mut(&mut self, world: WorldId) -> Option<&mut CommandBuffer> {
         self.command_buffer.get_mut(&world)
@@ -173,18 +191,17 @@ where
             .or_insert_with(|| CommandBuffer::new(world));
 
         //info!("Running");
-        self.system.run(&mut resources, queries, cmd, &mut world_shim);
+        self.system
+            .run(&mut resources, queries, cmd, &mut world_shim);
     }
 }
-
-
 
 impl<'a, R, Q> SystemWrapper<'a, R, Q>
 where
     R: ResourceData + ResourceSet<'static>,
     Q: QueryData + std::default::Default,
 {
-    fn new(system: &'a mut (System<ResourceData = R, QueryData = Q> + Send + Sync)) -> Self {
+    fn new(system: &'a mut (dyn System<ResourceData = R, QueryData = Q> + Send + Sync)) -> Self {
         Self {
             name: "test".into(),
             _resources: PhantomData::<R>,
@@ -204,16 +221,28 @@ struct TestSystem {}
 
 impl System for TestSystem {
     type QueryData = (
-        Query<Write::<Position>, <Write::<Position> as DefaultFilter>::Filter>,
-        Query<Read::<Velocity>, <Read::<Velocity> as DefaultFilter>::Filter>
+        Query<Write<Position>, <Write<Position> as DefaultFilter>::Filter>,
+        Query<Read<Velocity>, EntityFilterTuple<ComponentFilter<Velocity>, Passthrough>>,
     );
 
-    type ResourceData = ();
+    type ResourceData = (
+        Read<TestResourceA>,
+        Write<TestResourceB>,
+    );
 
-    fn run(&mut self, _res: &mut <Self::ResourceData as ResourceSet>::Result, (pos, _vel): &mut Self::QueryData, _command_buffer: &mut CommandBuffer, world: &mut SubWorld) {
+    fn run(
+        &mut self,
+        (res_a, res_b): &mut <Self::ResourceData as ResourceSet>::Result,
+        (pos, _vel): &mut Self::QueryData,
+        _command_buffer: &mut CommandBuffer,
+        world: &mut SubWorld,
+    ) {
+        println!("TestResourceA: {}", res_a.a);
+        println!("TestResourceB: {}", res_b.b);
+
         for position in pos.iter_mut(world) {
             position.x += 1.0;
-            println!("executed");
+            println!("Position x: {}", position.x);
         }
     }
 }
@@ -221,6 +250,9 @@ impl System for TestSystem {
 fn main() {
     let mut resources = Resources::default();
     let mut world = Universe::new().create_world();
+
+    resources.insert(TestResourceA { a: 1234 });
+    resources.insert(TestResourceB { b: 4321 });
 
     // or extend via an IntoIterator of tuples to add many at once (this is faster)
     let _entities: &[Entity] = world.extend(vec![
@@ -230,9 +262,12 @@ fn main() {
     ]);
 
     let mut test_system = TestSystem {};
-    let test_system = unsafe { std::mem::transmute::<_, &'static mut TestSystem>(&mut test_system) };
-    println!("Permissions: {:?}", <TestSystem as System>::QueryData::permissions());
-
+    let test_system =
+        unsafe { std::mem::transmute::<_, &'static mut TestSystem>(&mut test_system) };
+    println!(
+        "Permissions: {:?}",
+        <TestSystem as System>::QueryData::permissions()
+    );
 
     // construct a schedule (you should do this on init)
     let mut schedule = Schedule::builder()
