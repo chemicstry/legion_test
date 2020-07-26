@@ -44,7 +44,9 @@ fn build_position_update_system() -> impl systems::Schedulable {
         })
 }
 
-pub trait SystemData<'a> {
+pub trait SystemData<'a>: Default {
+    type Result: 'a;
+
     fn component_permissions() -> Permissions<ComponentTypeId> {
         return Permissions::default();
     }
@@ -56,67 +58,71 @@ pub trait SystemData<'a> {
     fn filter_archetypes(&mut self, world: &World, archetypes: &mut BitSet) {
     }
 
-    unsafe fn fetch_unchecked(resources: &'a Resources) -> Self;
+    unsafe fn fetch_unchecked(&mut self, resources: &'a Resources) -> &mut Self::Result;
 }
 
 impl<'a> SystemData<'a> for () {
-    unsafe fn fetch_unchecked(resources: &'a Resources) -> Self { }
+    type Result = ();
+
+    unsafe fn fetch_unchecked(&mut self, resources: &'a Resources) -> &mut Self::Result { &mut () }
 }
 
 impl<'a, V, F> SystemData<'a> for Query<V, F>
 where
-    V: for<'b> View<'b>,
+    V: for<'b> View<'b> + 'a,
     F: 'static + EntityFilter,
 {
+    type Result = Self;
+
     fn component_permissions() -> Permissions<ComponentTypeId> {
         return V::requires_permissions();
     }
 
-    unsafe fn fetch_unchecked(resources: &'a Resources) -> Self {
-        Self::default()
+    unsafe fn fetch_unchecked(&mut self, resources: &'a Resources) -> &mut Self::Result {
+        self
     }
 }
 
-impl<'a, T> SystemData<'a> for Fetch<'a, T>
+impl<'a, T> SystemData<'a> for Read<T>
 where
     T: Resource,
 {
+    type Result = Fetch<'a, T>;
+
     fn resource_permissions() -> Permissions<ResourceTypeId> {
         let mut permissions = Permissions::default();
         permissions.push_read(ResourceTypeId::of::<T>());
         return permissions;
     }
 
-    unsafe fn fetch_unchecked(resources: &'a Resources) -> Self {
-        resources
-            .get::<T>()
-            .unwrap_or_else(|| panic!("Failed to fetch resource!: {}", std::any::type_name::<T>()))
+    unsafe fn fetch_unchecked(&mut self, resources: &'a Resources) -> &mut Self::Result {
+        &mut <Self as ResourceSet<'a>>::fetch_unchecked(resources)
     }
 }
 
-impl<'a, T> SystemData<'a> for FetchMut<'a, T>
+impl<'a, T> SystemData<'a> for Write<T>
 where
     T: Resource,
 {
+    type Result = FetchMut<'a, T>;
+
     fn resource_permissions() -> Permissions<ResourceTypeId> {
         let mut permissions = Permissions::default();
         permissions.push(ResourceTypeId::of::<T>());
         return permissions;
     }
 
-    unsafe fn fetch_unchecked(resources: &'a Resources) -> Self {
-        resources
-            .get_mut::<T>()
-            .unwrap_or_else(|| panic!("Failed to fetch resource!: {}", std::any::type_name::<T>()))
+    unsafe fn fetch_unchecked(&mut self, resources: &'a Resources) -> &mut Self::Result {
+        &mut <Self as ResourceSet<'a>>::fetch_unchecked(resources)
     }
 }
 
 pub trait System<'a> {
-    type SystemData: SystemData<'a>;
+    type Data: SystemData<'a>;
 
     fn run(
         &mut self,
-        data: &mut Self::SystemData,
+        data: &mut <Self::Data as SystemData<'a>>::Result,
         command_buffer: &mut CommandBuffer,
         world: &mut SubWorld,
     );
@@ -124,14 +130,14 @@ pub trait System<'a> {
 
 pub struct SystemWrapper<'a, D> {
     name: SystemId,
-    // data: D,
+    data: D,
     archetypes: ArchetypeAccess,
     access: SystemAccess,
 
     // We pre-allocate a command buffer for ourself. Writes are self-draining so we never have to rellocate.
     command_buffer: HashMap<WorldId, CommandBuffer>,
 
-    system: &'a mut (dyn System<'a, SystemData = D> + Send + Sync),
+    system: &'a mut (dyn System<'a, Data = D> + Send + Sync),
 }
 
 #[derive(Debug, Clone)]
@@ -191,7 +197,7 @@ where
         // must be shorter than the lifetime of the resource.
         let resources_static = std::mem::transmute::<_, &'static Resources>(resources);
         //let mut resources = R::fetch_unchecked(resources_static);
-        let mut data = D::fetch_unchecked(resources_static);
+        let mut data = self.data.fetch_unchecked(resources_static);
 
         //let queries = &mut self.queries;
         let component_access = ComponentAccess::Allow(Cow::Borrowed(&self.access.components));
@@ -212,10 +218,10 @@ impl<'a, D> SystemWrapper<'a, D>
 where
     D: SystemData<'a>
 {
-    fn new(system: &'a mut (dyn System<'a, SystemData = D> + Send + Sync)) -> Self {
+    fn new(system: &'a mut (dyn System<'a, Data = D> + Send + Sync)) -> Self {
         Self {
             name: "test".into(),
-            // data: D::default(),
+            data: D::default(),
             archetypes: ArchetypeAccess::Some(BitSet::default()),
             access: SystemAccess {
                 resources: D::resource_permissions(),
@@ -230,16 +236,16 @@ where
 struct TestSystem {}
 
 impl<'a> System<'a> for TestSystem {
-    type SystemData = (
+    type Data = (
         Query<Write<Position>, <Write<Position> as DefaultFilter>::Filter>,
         Query<(Entity, Read<Velocity>), EntityFilterTuple<ComponentFilter<Position>, Passthrough>>,
-        Fetch<'a, TestResourceA>,
-        FetchMut<'a, TestResourceB>,
+        Read<TestResourceA>,
+        Write<TestResourceB>,
     );
 
     fn run(
         &mut self,
-        (pos, posvel, res_a, res_b): &mut Self::SystemData,
+        (pos, posvel, res_a, res_b): &mut <Self::Data as SystemData>::Result,
         _command_buffer: &mut CommandBuffer,
         world: &mut SubWorld,
     ) {
@@ -283,8 +289,8 @@ fn main() {
         unsafe { std::mem::transmute::<_, &'static mut TestSystem>(&mut test_system) };
     println!(
         "Permissions res: {:?}, comp: {:?}",
-        <TestSystem as System>::SystemData::resource_permissions(),
-        <TestSystem as System>::SystemData::component_permissions()
+        <TestSystem as System>::Data::resource_permissions(),
+        <TestSystem as System>::Data::component_permissions()
     );
 
     // construct a schedule (you should do this on init)
@@ -304,6 +310,8 @@ macro_rules! impl_data {
         impl<'a, $($ty),*> SystemData<'a> for ( $( $ty , )* )
         where $( $ty : SystemData<'a> ),*
         {
+            type Result = (&'a mut $( <$ty as SystemData<'a>>::Result, )*);
+
             fn component_permissions() -> Permissions<ComponentTypeId> {
                 let mut a = Permissions::default();
 
@@ -332,8 +340,8 @@ macro_rules! impl_data {
                 $( $ty.filter_archetypes(world, bitset); )*
             }
 
-            unsafe fn fetch_unchecked(resources: &'a Resources) -> Self {
-                ($( $ty::fetch_unchecked(resources), )*)
+            unsafe fn fetch_unchecked(&mut self, resources: &'a Resources) -> &mut Self::Result {
+                ($( $ty::fetch_unchecked(self.$nidx, resources), )*)
             }
         }
     };
